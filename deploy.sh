@@ -91,6 +91,13 @@ set_env MULTICA_BACKEND_IMAGE "multica-backend"
 set_env MULTICA_IMAGE_TAG "${TAG}"
 if [ "$WITH_FRONTEND" = "1" ]; then
   set_env MULTICA_WEB_IMAGE "multica-web"
+  set_env MULTICA_WEB_IMAGE_TAG "${TAG}"
+else
+  # Frontend stays on the upstream GHCR image. Pin its tag independently so
+  # the shared MULTICA_IMAGE_TAG (now the backend's fork tag) doesn't make the
+  # frontend resolve to a nonexistent tag like multica-web:dev.
+  set_env MULTICA_WEB_IMAGE "ghcr.io/multica-ai/multica-web"
+  set_env MULTICA_WEB_IMAGE_TAG "latest"
 fi
 
 # 4. Required pre-migrate step on version jumps: the task-usage hourly backfill

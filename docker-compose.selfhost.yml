@@ -92,7 +92,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: ${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:${MULTICA_IMAGE_TAG:-latest}
+    image: ${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:${MULTICA_WEB_IMAGE_TAG:-${MULTICA_IMAGE_TAG:-latest}}
     depends_on:
       - backend
     ports:
