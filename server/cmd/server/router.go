@@ -139,6 +139,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		TrustedProxies:           parseTrustedProxies(os.Getenv("MULTICA_TRUSTED_PROXIES")),
 		CloudRuntimeFleetURL:     cloudRuntimeFleetURLFromEnv(),
 		CloudRuntimeFleetTimeout: envDuration("MULTICA_CLOUD_FLEET_TIMEOUT", 35*time.Second),
+		Lark: handler.LarkConfig{
+			AppID:             strings.TrimSpace(os.Getenv("MULTICA_LARK_APP_ID")),
+			AppSecret:         strings.TrimSpace(os.Getenv("MULTICA_LARK_APP_SECRET")),
+			VerificationToken: strings.TrimSpace(os.Getenv("MULTICA_LARK_VERIFICATION_TOKEN")),
+			BaseURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("MULTICA_LARK_BASE_URL")), "/"),
+			WorkspaceID:       strings.TrimSpace(os.Getenv("MULTICA_LARK_WORKSPACE_ID")),
+			AgentID:           strings.TrimSpace(os.Getenv("MULTICA_LARK_AGENT_ID")),
+			CreatorUserID:     strings.TrimSpace(os.Getenv("MULTICA_LARK_CREATOR_USER_ID")),
+			Priority:          strings.TrimSpace(os.Getenv("MULTICA_LARK_PRIORITY")),
+		},
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
 	if opts.DaemonWakeup != nil {
@@ -281,6 +291,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// only forward the bytes + the Stripe-Signature header; see
 	// HandleCloudBillingStripeWebhook for the rationale).
 	r.Post("/api/webhooks/stripe", h.HandleCloudBillingStripeWebhook)
+	// Lark (Feishu) message-shortcut ingress (no Multica auth — the Lark
+	// verification token in the body IS the credential). Imports a message
+	// thread into an issue assigned to the configured triage agent. Returns
+	// 404 until the MULTICA_LARK_* env vars are set. See lark_webhook.go.
+	r.Post("/api/webhooks/lark", h.HandleLarkWebhook)
 
 	// Daemon API routes (require daemon token or valid user token)
 	r.Route("/api/daemon", func(r chi.Router) {

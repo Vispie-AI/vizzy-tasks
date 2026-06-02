@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,6 +21,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/lark"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -80,6 +82,38 @@ type Config struct {
 	// return 503 instead of attempting to dial a hard-coded private service.
 	CloudRuntimeFleetURL     string
 	CloudRuntimeFleetTimeout time.Duration
+
+	// Lark holds the configuration for the inbound Lark message-shortcut
+	// webhook (POST /api/webhooks/lark). When LarkVerificationToken is empty
+	// the endpoint is considered disabled and returns 404. See lark_webhook.go.
+	Lark LarkConfig
+}
+
+// LarkConfig configures the Lark → issue ingress. All values come from the
+// MULTICA_LARK_* env vars (see router.go). The webhook lands every imported
+// thread in WorkspaceID, assigns it to AgentID for triage, and records
+// CreatorUserID (a real workspace member, typically a dedicated "system"
+// account) as the issue creator since a webhook has no logged-in user.
+type LarkConfig struct {
+	AppID             string
+	AppSecret         string
+	VerificationToken string
+	BaseURL           string
+	WorkspaceID       string
+	AgentID           string
+	CreatorUserID     string
+	// Priority for created issues (none|low|medium|high|urgent). Defaults to
+	// "medium" when unset.
+	Priority string
+}
+
+// Enabled reports whether the Lark webhook is configured enough to serve. We
+// require the verification token (the request authenticator) plus the routing
+// targets; without any of these the handler returns 404 so an unconfigured
+// fork doesn't expose a half-working ingress.
+func (c LarkConfig) Enabled() bool {
+	return c.VerificationToken != "" && c.AppID != "" && c.AppSecret != "" &&
+		c.WorkspaceID != "" && c.AgentID != "" && c.CreatorUserID != ""
 }
 
 type cloudRuntimeProxy interface {
@@ -113,6 +147,20 @@ type Handler struct {
 	WebhookIPRateLimiter  WebhookRateLimiter
 	CloudRuntime          cloudRuntimeProxy
 	cfg                   Config
+
+	larkOnce   sync.Once
+	larkClient *lark.Client
+}
+
+// larkAPI returns the lazily-constructed Lark client, or nil when the Lark
+// webhook is not configured. Built once per Handler from h.cfg.Lark.
+func (h *Handler) larkAPI() *lark.Client {
+	h.larkOnce.Do(func() {
+		if h.cfg.Lark.Enabled() {
+			h.larkClient = lark.NewClient(h.cfg.Lark.AppID, h.cfg.Lark.AppSecret, h.cfg.Lark.BaseURL)
+		}
+	})
+	return h.larkClient
 }
 
 func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *events.Bus, emailService *service.EmailService, store storage.Storage, cfSigner *auth.CloudFrontSigner, analyticsClient analytics.Client, cfg Config, daemonHubs ...*daemonws.Hub) *Handler {
