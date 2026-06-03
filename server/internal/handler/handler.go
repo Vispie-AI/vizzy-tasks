@@ -158,6 +158,7 @@ type Handler struct {
 
 	larkOnce   sync.Once
 	larkClient *lark.Client
+	larkDedup  *larkDedupe
 }
 
 // larkAPI returns the lazily-constructed Lark client, or nil when the Lark
@@ -167,6 +168,7 @@ func (h *Handler) larkAPI() *lark.Client {
 		if h.cfg.Lark.Enabled() {
 			h.larkClient = lark.NewClient(h.cfg.Lark.AppID, h.cfg.Lark.AppSecret, h.cfg.Lark.BaseURL)
 		}
+		h.larkDedup = newLarkDedupe()
 	})
 	return h.larkClient
 }

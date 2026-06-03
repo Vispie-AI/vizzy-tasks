@@ -250,15 +250,54 @@ func (c *Client) DownloadResource(ctx context.Context, res Resource) ([]byte, st
 
 // Reply posts a plain-text reply to a message (threads the reply under it).
 // Best-effort: failures are returned but callers typically just log them.
-func (c *Client) Reply(ctx context.Context, messageID, text string) error {
+// ReplyPayload is a pre-built reply (msg_type + JSON content) for Reply.
+type ReplyPayload struct {
+	MsgType string
+	Content string // JSON string per the Lark content schema for MsgType
+}
+
+// PostText builds a rich-text ("post") reply containing a single line of text.
+func PostText(text string) ReplyPayload {
+	return postPayload([]map[string]any{
+		{"tag": "text", "text": text},
+	})
+}
+
+// PostLink builds a rich-text reply: leading plain text followed by a
+// hyperlink whose visible label is linkText (e.g. "✅ Created " + "VIZ-411").
+func PostLink(prefix, linkText, href string) ReplyPayload {
+	segs := []map[string]any{}
+	if prefix != "" {
+		segs = append(segs, map[string]any{"tag": "text", "text": prefix})
+	}
+	segs = append(segs, map[string]any{"tag": "a", "text": linkText, "href": href})
+	return postPayload(segs)
+}
+
+// postPayload wraps one line of rich-text segments into a Lark `post` content
+// payload. Lark requires a locale key; we use zh_cn since this tenant is on
+// Lark/Feishu and zh_cn renders identically for ASCII content.
+func postPayload(segments []map[string]any) ReplyPayload {
+	content := map[string]any{
+		"zh_cn": map[string]any{
+			"title":   "",
+			"content": [][]map[string]any{segments},
+		},
+	}
+	b, _ := json.Marshal(content)
+	return ReplyPayload{MsgType: "post", Content: string(b)}
+}
+
+// Reply posts a reply to a message (threads the reply under it). Best-effort:
+// failures are returned but callers typically just log them.
+func (c *Client) Reply(ctx context.Context, messageID string, payload ReplyPayload) error {
 	token, err := c.tenantToken(ctx)
 	if err != nil {
 		return err
 	}
-	contentJSON, _ := json.Marshal(map[string]string{"text": text})
 	bodyJSON, _ := json.Marshal(map[string]string{
-		"msg_type": "text",
-		"content":  string(contentJSON),
+		"msg_type": payload.MsgType,
+		"content":  payload.Content,
 	})
 	u := c.baseURL + "/open-apis/im/v1/messages/" + url.PathEscape(messageID) + "/reply"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(bodyJSON))

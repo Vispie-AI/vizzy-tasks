@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +26,43 @@ import (
 // blowing up the triage agent's context window (and our memory). 200 messages
 // is far beyond any realistic task-tracking thread.
 const maxLarkThreadMessages = 200
+
+// larkEventDedupeTTL is how long a processed Lark event_id is remembered so
+// Lark's at-least-once retries (it resends if it doesn't see a fast 200) don't
+// create duplicate issues / duplicate replies.
+const larkEventDedupeTTL = 10 * time.Minute
+
+// larkDedupe is a tiny in-memory TTL set of Lark event_ids we've already
+// accepted. Single-node by design (matches the rest of the self-host stack);
+// a brief double-fire across a restart is harmless because the issue
+// duplicate-guard still catches it.
+type larkDedupe struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+func newLarkDedupe() *larkDedupe { return &larkDedupe{seen: map[string]time.Time{}} }
+
+// seenBefore returns true if id was already accepted within the TTL; otherwise
+// it records id and returns false. Also opportunistically evicts expired ids.
+func (d *larkDedupe) seenBefore(id string) bool {
+	if id == "" {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	if ts, ok := d.seen[id]; ok && now.Sub(ts) < larkEventDedupeTTL {
+		return true
+	}
+	for k, ts := range d.seen {
+		if now.Sub(ts) >= larkEventDedupeTTL {
+			delete(d.seen, k)
+		}
+	}
+	d.seen[id] = now
+	return false
+}
 
 // larkChallenge is the URL-verification handshake body Lark POSTs when you
 // first set the request URL in the developer console.
@@ -45,6 +83,7 @@ type larkCallback struct {
 	// v2 fields
 	Header struct {
 		Token     string `json:"token"`
+		EventID   string `json:"event_id"`
 		EventType string `json:"event_type"`
 	} `json:"header"`
 	Event larkEvent `json:"event"`
@@ -173,30 +212,54 @@ func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process the import. ACK fast either way; post feedback into the thread.
-	threadAnchor := msg.MessageID
-	issue, dup, err := h.importLarkThread(r.Context(), msg.MessageID)
-	if err != nil {
-		slog.Error("lark webhook: import failed", "message_id", msg.MessageID, "error", err)
-		h.larkReply(r.Context(), threadAnchor, "❌ Failed to create task: "+err.Error())
-		writeJSON(w, http.StatusOK, map[string]string{"msg": "error"})
+	// Dedupe Lark's at-least-once retries by event_id. Lark resends an event
+	// when it doesn't observe a fast 200; without this a slow import would
+	// fire twice (one "created", one "already exists"). We ensure the client
+	// (and dedupe set) are initialised via larkAPI() first.
+	h.larkAPI()
+	if h.larkDedup != nil && h.larkDedup.seenBefore(cb.Header.EventID) {
+		writeJSON(w, http.StatusOK, map[string]string{"msg": "duplicate event"})
 		return
 	}
 
-	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-	ident := fmt.Sprintf("%s-%d", prefix, issue.Number)
-	link := h.larkIssueURL(r.Context(), issue)
-	verb := "✅ Created task"
-	if dup {
-		verb = "ℹ️ Task already exists:"
+	// ACK immediately so Lark never retries, then do the heavy work (thread
+	// fetch + attachment upload + issue create + reply) in the background.
+	// We detach from the request context (which is cancelled once we return)
+	// and cap the work with our own timeout.
+	messageID := msg.MessageID
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		h.processLarkImport(ctx, messageID)
+	}()
+	writeJSON(w, http.StatusOK, map[string]string{"msg": "accepted"})
+}
+
+// processLarkImport runs the full import for one @mention and posts the result
+// reply back into the thread. Runs in a background goroutine after the webhook
+// has already ACKed Lark.
+func (h *Handler) processLarkImport(ctx context.Context, messageID string) {
+	issue, dup, err := h.importLarkThread(ctx, messageID)
+	if err != nil {
+		slog.Error("lark webhook: import failed", "message_id", messageID, "error", err)
+		h.larkReply(ctx, messageID, lark.PostText("❌ Failed to create task: "+err.Error()))
+		return
 	}
-	reply := verb + " " + ident
-	if link != "" {
-		reply = verb + " " + ident + "\n" + link
+
+	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
+	ident := fmt.Sprintf("%s-%d", prefix, issue.Number)
+	link := h.larkIssueURL(ctx, issue)
+	verb := "✅ Created "
+	if dup {
+		verb = "ℹ️ Task already exists: "
 	}
 	slog.Info("lark webhook: issue ready", "identifier", ident, "duplicate", dup)
-	h.larkReply(r.Context(), threadAnchor, reply)
-	writeJSON(w, http.StatusOK, map[string]string{"msg": "ok", "identifier": ident})
+	// Rich-text reply: make the identifier itself the clickable link.
+	if link != "" {
+		h.larkReply(ctx, messageID, lark.PostLink(verb, ident, link))
+	} else {
+		h.larkReply(ctx, messageID, lark.PostText(verb+ident))
+	}
 }
 
 // larkIssueURL builds the public web-app URL for an issue, or "" when AppURL
@@ -491,14 +554,14 @@ func formatLarkTime(ms int64) string {
 	return time.UnixMilli(ms).UTC().Format("2006-01-02 15:04 UTC")
 }
 
-// larkReply posts a best-effort plain-text reply back into the thread so the
-// user gets feedback. Failures are logged, never fatal.
-func (h *Handler) larkReply(ctx context.Context, messageID, text string) {
+// larkReply posts a best-effort reply back into the thread so the user gets
+// feedback. Failures are logged, never fatal.
+func (h *Handler) larkReply(ctx context.Context, messageID string, payload lark.ReplyPayload) {
 	client := h.larkAPI()
 	if client == nil || messageID == "" {
 		return
 	}
-	if err := client.Reply(ctx, messageID, text); err != nil {
+	if err := client.Reply(ctx, messageID, payload); err != nil {
 		slog.Warn("lark webhook: reply failed", "message_id", messageID, "error", err)
 	}
 }
