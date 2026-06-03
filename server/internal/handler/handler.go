@@ -102,6 +102,10 @@ type LarkConfig struct {
 	WorkspaceID       string
 	AgentID           string
 	CreatorUserID     string
+	// BotOpenID is the bot's own open_id. When set, the handler only reacts to
+	// messages that @mention this id; when empty, any @mention triggers it.
+	// Optional — leave unset if the bot is the only app mentioned in your chats.
+	BotOpenID string
 	// Priority for created issues (none|low|medium|high|urgent). Defaults to
 	// "medium" when unset.
 	Priority string

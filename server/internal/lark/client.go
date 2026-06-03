@@ -248,6 +248,43 @@ func (c *Client) DownloadResource(ctx context.Context, res Resource) ([]byte, st
 	return data, ct, nil
 }
 
+// Reply posts a plain-text reply to a message (threads the reply under it).
+// Best-effort: failures are returned but callers typically just log them.
+func (c *Client) Reply(ctx context.Context, messageID, text string) error {
+	token, err := c.tenantToken(ctx)
+	if err != nil {
+		return err
+	}
+	contentJSON, _ := json.Marshal(map[string]string{"text": text})
+	bodyJSON, _ := json.Marshal(map[string]string{
+		"msg_type": "text",
+		"content":  string(contentJSON),
+	})
+	u := c.baseURL + "/open-apis/im/v1/messages/" + url.PathEscape(messageID) + "/reply"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(bodyJSON))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if decErr := json.NewDecoder(resp.Body).Decode(&out); decErr != nil {
+		return decErr
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("lark reply: code=%d msg=%s", out.Code, out.Msg)
+	}
+	return nil
+}
+
 // ── parsing ──────────────────────────────────────────────────────────────---
 
 func parseMessage(rm rawMessage) Message {

@@ -34,38 +34,72 @@ type larkChallenge struct {
 	Type      string `json:"type"`
 }
 
-// larkCallback is the (decrypted, plain-JSON) callback envelope. We only read
-// the fields needed to authenticate the request and locate the message; the
-// rest of the (large, schema-drifting) payload is ignored.
+// larkCallback is the (plain-JSON) callback envelope. We support the v2 event
+// schema (used by im.message.receive_v1), where the verification token lives
+// under `header.token` and the typed event payload under `event`. The legacy
+// v1 top-level `token` is also accepted for the url_verification handshake.
 type larkCallback struct {
-	Token  string `json:"token"`
-	Type   string `json:"type"`
+	// v1 fields (url_verification handshake)
+	Token string `json:"token"`
+	Type  string `json:"type"`
+	// v2 fields
 	Header struct {
-		Token string `json:"token"`
+		Token     string `json:"token"`
+		EventType string `json:"event_type"`
 	} `json:"header"`
-	Event map[string]any `json:"event"`
-	// Some message-action shapes put the id at top level.
-	OpenMessageID string `json:"open_message_id"`
-	MessageID     string `json:"message_id"`
+	Event larkEvent `json:"event"`
 }
 
-// HandleLarkWebhook is the public ingress for the Lark message-shortcut → issue
-// flow. It runs OUTSIDE the authenticated route group: the Lark verification
-// token in the body IS the credential.
+// larkEvent is the slice of an im.message.receive_v1 event we consume. The bot
+// receives this when it is @mentioned in (or DM'd) a chat it belongs to.
+type larkEvent struct {
+	Sender struct {
+		SenderID struct {
+			OpenID string `json:"open_id"`
+		} `json:"sender_id"`
+		SenderType string `json:"sender_type"`
+	} `json:"sender"`
+	Message struct {
+		MessageID   string `json:"message_id"`
+		RootID      string `json:"root_id"`
+		ParentID    string `json:"parent_id"`
+		ThreadID    string `json:"thread_id"`
+		ChatID      string `json:"chat_id"`
+		ChatType    string `json:"chat_type"`
+		MessageType string `json:"message_type"`
+		Content     string `json:"content"`
+		Mentions    []struct {
+			Key string `json:"key"`
+			ID  struct {
+				OpenID string `json:"open_id"`
+			} `json:"id"`
+			Name string `json:"name"`
+		} `json:"mentions"`
+	} `json:"message"`
+}
+
+// HandleLarkWebhook is the public ingress for the Lark "@mention the bot in a
+// thread → create an issue" flow. It runs OUTSIDE the authenticated route
+// group: the Lark verification token in the event body IS the credential.
+//
+// Trigger: a user @mentions the bot in a message (typically a reply inside a
+// thread). Lark delivers an im.message.receive_v1 event; we pull the whole
+// thread (root + replies + attachments) into one issue assigned to the triage
+// agent, which Multica auto-enqueues.
 //
 // Flow:
 //  1. Per-IP rate limit (reuse the autopilot webhook limiter).
 //  2. Read + cap the body.
 //  3. url_verification handshake → echo the challenge.
-//  4. Verify the Lark verification token.
-//  5. Extract the clicked message id, resolve its thread, pull all replies.
+//  4. Verify the Lark verification token (header.token, v2 schema).
+//  5. Only act on im.message.receive_v1 where the bot was @mentioned (and the
+//     sender is not the bot itself). Resolve the thread and pull all replies.
 //  6. Re-upload each image/file resource into Multica storage.
-//  7. Create an issue (same tx as CreateIssue) assigned to the triage agent —
-//     which auto-enqueues the agent — and return a card "toast" to Lark.
+//  7. Create an issue (same tx as CreateIssue) assigned to the triage agent.
 //
-// Responses are always 200 with a Lark card-action toast body on the happy
-// path so the user sees inline feedback; failures still return 200 with an
-// error toast so Lark doesn't retry an un-actionable callback.
+// We ACK every event with 200 quickly (Lark retries non-2xx and dedupes by
+// event_id). Errors are logged, and a best-effort reply is posted back into
+// the thread so the user gets feedback.
 func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 	if !h.cfg.Lark.Enabled() {
 		writeError(w, http.StatusNotFound, "lark webhook not configured")
@@ -102,77 +136,81 @@ func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Parse + authenticate.
+	// 4. Parse + authenticate (v2 header token, fall back to v1 top-level).
 	var cb larkCallback
 	if err := json.Unmarshal(body, &cb); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	token := cb.Token
+	token := cb.Header.Token
 	if token == "" {
-		token = cb.Header.Token
+		token = cb.Token
 	}
 	if token != h.cfg.Lark.VerificationToken {
 		writeError(w, http.StatusUnauthorized, "invalid token")
 		return
 	}
 
-	// 5. Locate the clicked message id.
-	messageID := extractLarkMessageID(cb)
-	if messageID == "" {
-		slog.Warn("lark webhook: no message id in callback", "body", truncate(string(body), 500))
-		// Ack so Lark stops retrying a payload we can't act on.
-		writeJSON(w, http.StatusOK, larkToast("error", "Could not find a message to import"))
+	// 5. Only handle inbound message events where the bot was @mentioned.
+	//    Anything else (other event types, non-mention messages, the bot's
+	//    own messages) is ACKed and ignored so Lark stops retrying.
+	if cb.Header.EventType != "" && cb.Header.EventType != "im.message.receive_v1" {
+		writeJSON(w, http.StatusOK, map[string]string{"msg": "ignored"})
+		return
+	}
+	msg := cb.Event.Message
+	if msg.MessageID == "" {
+		writeJSON(w, http.StatusOK, map[string]string{"msg": "no message"})
+		return
+	}
+	if cb.Event.Sender.SenderType == "app" || cb.Event.Sender.SenderType == "bot" {
+		// Never react to our own / another bot's messages — avoids loops.
+		writeJSON(w, http.StatusOK, map[string]string{"msg": "ignored bot sender"})
+		return
+	}
+	if !larkMentionsBot(cb.Event, h.cfg.Lark.BotOpenID) {
+		writeJSON(w, http.StatusOK, map[string]string{"msg": "not mentioned"})
 		return
 	}
 
-	issue, dup, err := h.importLarkThread(r.Context(), messageID)
+	// Process the import. ACK fast either way; post feedback into the thread.
+	threadAnchor := msg.MessageID
+	issue, dup, err := h.importLarkThread(r.Context(), msg.MessageID)
 	if err != nil {
-		slog.Error("lark webhook: import failed", "message_id", messageID, "error", err)
-		writeJSON(w, http.StatusOK, larkToast("error", "Failed to create task: "+err.Error()))
+		slog.Error("lark webhook: import failed", "message_id", msg.MessageID, "error", err)
+		h.larkReply(r.Context(), threadAnchor, "❌ Failed to create task: "+err.Error())
+		writeJSON(w, http.StatusOK, map[string]string{"msg": "error"})
 		return
 	}
 
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
 	ident := fmt.Sprintf("%s-%d", prefix, issue.Number)
-	msg := "Created task " + ident
+	reply := "✅ Created task " + ident
 	if dup {
-		msg = "Task already exists: " + ident
+		reply = "ℹ️ Task already exists: " + ident
 	}
 	slog.Info("lark webhook: issue ready", "identifier", ident, "duplicate", dup)
-	writeJSON(w, http.StatusOK, larkToast("success", msg))
+	h.larkReply(r.Context(), threadAnchor, reply)
+	writeJSON(w, http.StatusOK, map[string]string{"msg": "ok", "identifier": ident})
 }
 
-// extractLarkMessageID digs the clicked message id out of whichever callback
-// shape arrived (card.action.trigger, message action shortcut, or top-level).
-func extractLarkMessageID(cb larkCallback) string {
-	if cb.OpenMessageID != "" {
-		return cb.OpenMessageID
+// larkMentionsBot reports whether the bot was @mentioned in the message. When
+// botOpenID is configured we match it exactly; otherwise (open id unset) we
+// treat ANY mention as "for us" — fine when the bot is the only app likely to
+// be @mentioned, and avoids a hard dependency on knowing the open id.
+func larkMentionsBot(ev larkEvent, botOpenID string) bool {
+	if len(ev.Message.Mentions) == 0 {
+		return false
 	}
-	if cb.MessageID != "" {
-		return cb.MessageID
+	if botOpenID == "" {
+		return true
 	}
-	ev := cb.Event
-	if ev == nil {
-		return ""
-	}
-	for _, key := range []string{"open_message_id", "message_id"} {
-		if v, ok := ev[key].(string); ok && v != "" {
-			return v
+	for _, m := range ev.Message.Mentions {
+		if m.ID.OpenID == botOpenID {
+			return true
 		}
 	}
-	// Nested under event.action (card callbacks) or event.context.
-	if action, ok := ev["action"].(map[string]any); ok {
-		if v, ok := action["open_message_id"].(string); ok && v != "" {
-			return v
-		}
-	}
-	if ctx, ok := ev["context"].(map[string]any); ok {
-		if v, ok := ctx["open_message_id"].(string); ok && v != "" {
-			return v
-		}
-	}
-	return ""
+	return false
 }
 
 // importLarkThread fetches the message + its thread, re-uploads attachments,
@@ -396,7 +434,7 @@ func larkTitle(messages []lark.Message) string {
 
 func larkDescription(messages []lark.Message) string {
 	var b strings.Builder
-	b.WriteString("> Imported from Lark via message shortcut.\n\n---\n")
+	b.WriteString("> Imported from Lark (bot @mention).\n\n---\n")
 	for i, m := range messages {
 		sender := m.SenderID
 		if sender == "" {
@@ -432,20 +470,19 @@ func formatLarkTime(ms int64) string {
 	return time.UnixMilli(ms).UTC().Format("2006-01-02 15:04 UTC")
 }
 
-// larkToast builds a Lark card-action response body. Lark renders the `toast`
-// field as an inline notification to the user who clicked the shortcut.
-func larkToast(kind, content string) map[string]any {
-	return map[string]any{"toast": map[string]string{"type": kind, "content": content}}
+// larkReply posts a best-effort plain-text reply back into the thread so the
+// user gets feedback. Failures are logged, never fatal.
+func (h *Handler) larkReply(ctx context.Context, messageID, text string) {
+	client := h.larkAPI()
+	if client == nil || messageID == "" {
+		return
+	}
+	if err := client.Reply(ctx, messageID, text); err != nil {
+		slog.Warn("lark webhook: reply failed", "message_id", messageID, "error", err)
+	}
 }
 
 // ── small local helpers ──────────────────────────────────────────────────---
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
-}
 
 // sanitizeFilename keeps S3 keys tame: strip path separators and spaces.
 func sanitizeFilename(name string) string {

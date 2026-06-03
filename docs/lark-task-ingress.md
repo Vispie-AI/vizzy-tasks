@@ -1,12 +1,12 @@
 # Lark → Task ingress (Vizzy fork)
 
-This fork adds a native endpoint that turns a **Lark message shortcut** into a
-Multica issue assigned to a triage agent. Click a shortcut on any message in a
-Lark thread → the whole thread (root message + all replies + image/file
+This fork adds a native endpoint that turns an **@mention of the bot in a Lark
+thread** into a Multica issue assigned to a triage agent. Reply to a thread with
+`@TaskBot ...` → the whole thread (root message + all replies + image/file
 attachments) is imported as one issue, assigned to a configured agent that
-triages it (writes a ticket / implementation plan / follow-up questions —
-it does **not** start the work; that behaviour is controlled by the agent's
-own instructions in Multica).
+triages it (writes a ticket / implementation plan / follow-up questions — it
+does **not** start the work; that behaviour is controlled by the agent's own
+instructions in Multica). The bot replies in-thread with the created task id.
 
 Everything runs **in-process** in the Multica Go backend — no sidecar, no PAT.
 
@@ -40,6 +40,11 @@ MULTICA_LARK_AGENT_ID=<triage agent uuid>
 # logged-in user). Use a dedicated "system" / "lark-bot" member account.
 MULTICA_LARK_CREATOR_USER_ID=<member user uuid>
 
+# Optional. The bot's own open_id. When set, only @mentions of THIS id trigger
+# an import; when empty, any @mention of the app does. Leave empty if the bot
+# is the only app likely to be @mentioned in your chats.
+MULTICA_LARK_BOT_OPEN_ID=
+
 # Optional. none|low|medium|high|urgent (default medium)
 MULTICA_LARK_PRIORITY=medium
 ```
@@ -55,35 +60,37 @@ Get the UUIDs from the CLI: `multica workspace list --output json`,
 1. **Create a custom app** in the [Lark Developer Console](https://open.larksuite.com/app)
    → "Custom App". Copy its **App ID** and **App Secret** into the env vars.
 2. **Enable the bot** capability (Features → Bot).
-3. **Permissions (scopes)** — add at least one message-read scope:
-   - `im:message` *(or)* `im:message:readonly`
-   - `im:message.history:readonly` (needed to read full thread replies)
-   - `im:resource` (download images/files) — also covered by the message
-     read scopes above on most tenants.
+3. **Permissions (scopes)** — add:
+   - `im:message` *(or)* `im:message:readonly` — read messages
+   - `im:message.history:readonly` — read full thread replies
+   - `im:resource` — download images/files
+   - `im:message:send_as_bot` — post the "Created task …" reply back in-thread
    Then **add the bot to the chat(s)** you'll use it in — the bot can only
-   read messages in groups it belongs to.
-4. **Event / callback URL**: point the app's request URL at
-   `https://<your-multica-host>/api/webhooks/lark`. Lark sends a
+   read/reply in groups it belongs to.
+4. **Event subscription**: set the app's request URL to
+   `https://tasks.vizzylabs.ai/api/webhooks/lark`. Lark sends a
    `url_verification` challenge — the handler answers it automatically once
-   `MULTICA_LARK_VERIFICATION_TOKEN` matches the **Verification Token** shown
-   in the console.
-5. **Message shortcut**: Features → Message Shortcut → add a shortcut whose
-   callback hits the same `/api/webhooks/lark` URL. This is the dropdown item
-   users click on a message.
+   `MULTICA_LARK_VERIFICATION_TOKEN` matches the **Verification Token** in the
+   console. Leave **Encrypt Key blank**.
+5. **Subscribe to the event** `im.message.receive_v1` (Receive message). This
+   is what fires when someone @mentions the bot.
 6. **Publish / release** a version of the app and (for internal use) approve it.
 
 ## How it behaves
 
-- Click the shortcut on any message in a thread → the handler fetches that
-  message, finds its `thread_id`, and pulls every reply (oldest-first, capped
-  at 200 messages).
+- A user @mentions the bot in a message (typically a reply in a thread):
+  `@TaskBot make this a ticket`. Lark delivers an `im.message.receive_v1`
+  event.
+- The handler verifies the bot was @mentioned (and the sender isn't a bot),
+  finds the message's `thread_id`, and pulls every message in the thread
+  (oldest-first, capped at 200).
 - Text (`text` / rich-text `post`) is rendered into the issue description;
   images and files are downloaded from Lark and re-uploaded as real Multica
   attachments linked to the issue.
 - The issue is created with status `todo` and assigned to the triage agent, so
   Multica enqueues the agent immediately.
-- The user sees an inline toast: `Created task ABC-123` (or
-  `Task already exists: ABC-123` if an active duplicate title is found).
+- The bot replies in the thread: `✅ Created task ABC-123` (or
+  `ℹ️ Task already exists: ABC-123` on an active-duplicate title).
 
 ## Keeping up with upstream
 

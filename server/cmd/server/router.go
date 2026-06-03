@@ -147,6 +147,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			WorkspaceID:       strings.TrimSpace(os.Getenv("MULTICA_LARK_WORKSPACE_ID")),
 			AgentID:           strings.TrimSpace(os.Getenv("MULTICA_LARK_AGENT_ID")),
 			CreatorUserID:     strings.TrimSpace(os.Getenv("MULTICA_LARK_CREATOR_USER_ID")),
+			BotOpenID:         strings.TrimSpace(os.Getenv("MULTICA_LARK_BOT_OPEN_ID")),
 			Priority:          strings.TrimSpace(os.Getenv("MULTICA_LARK_PRIORITY")),
 		},
 	}
