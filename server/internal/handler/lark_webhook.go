@@ -235,11 +235,20 @@ func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"msg": "accepted"})
 }
 
+// larkOutcome describes what the import did with the thread's task.
+type larkOutcome int
+
+const (
+	larkCreated   larkOutcome = iota // a new issue was created
+	larkUpdated                      // an existing thread's issue got a new comment
+	larkDuplicate                    // an active-duplicate title already existed
+)
+
 // processLarkImport runs the full import for one @mention and posts the result
 // reply back into the thread. Runs in a background goroutine after the webhook
 // has already ACKed Lark.
 func (h *Handler) processLarkImport(ctx context.Context, messageID string) {
-	issue, dup, err := h.importLarkThread(ctx, messageID)
+	issue, outcome, err := h.importLarkThread(ctx, messageID)
 	if err != nil {
 		slog.Error("lark webhook: import failed", "message_id", messageID, "error", err)
 		h.larkReply(ctx, messageID, lark.PostText("❌ Failed to create task: "+err.Error()))
@@ -249,11 +258,16 @@ func (h *Handler) processLarkImport(ctx context.Context, messageID string) {
 	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
 	ident := fmt.Sprintf("%s-%d", prefix, issue.Number)
 	link := h.larkIssueURL(ctx, issue)
-	verb := "✅ Created "
-	if dup {
+	var verb string
+	switch outcome {
+	case larkUpdated:
+		verb = "✏️ Updated "
+	case larkDuplicate:
 		verb = "ℹ️ Task already exists: "
+	default:
+		verb = "✅ Created "
 	}
-	slog.Info("lark webhook: issue ready", "identifier", ident, "duplicate", dup)
+	slog.Info("lark webhook: issue ready", "identifier", ident, "outcome", outcome)
 	// Rich-text reply: make the identifier itself the clickable link.
 	if link != "" {
 		h.larkReply(ctx, messageID, lark.PostLink(verb, ident, link))
@@ -297,17 +311,29 @@ func larkMentionsBot(ev larkEvent, botOpenID string) bool {
 	return false
 }
 
-// importLarkThread fetches the message + its thread, re-uploads attachments,
-// and creates the triage issue. Returns (issue, isDuplicate, error).
-func (h *Handler) importLarkThread(ctx context.Context, messageID string) (db.Issue, bool, error) {
+// importLarkThread fetches the message + its thread and either creates a new
+// triage issue or, when the thread already maps to one, appends the latest
+// context as a comment (re-triggering the agent). The thread→issue link is
+// stored in issue metadata under "lark_thread_id".
+func (h *Handler) importLarkThread(ctx context.Context, messageID string) (db.Issue, larkOutcome, error) {
 	client := h.larkAPI()
 	if client == nil {
-		return db.Issue{}, false, fmt.Errorf("lark client unavailable")
+		return db.Issue{}, larkCreated, fmt.Errorf("lark client unavailable")
 	}
 
 	clicked, err := client.GetMessage(ctx, messageID)
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("get message: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("get message: %w", err)
+	}
+
+	// The thread key: thread_id for topic threads, else root_id, else the
+	// message id itself (a standalone message is its own "thread").
+	threadKey := clicked.ThreadID
+	if threadKey == "" {
+		threadKey = clicked.RootID
+	}
+	if threadKey == "" {
+		threadKey = clicked.MessageID
 	}
 
 	// A threaded/topic message has a thread_id; pull the whole thread. A plain
@@ -316,7 +342,7 @@ func (h *Handler) importLarkThread(ctx context.Context, messageID string) (db.Is
 	if clicked.ThreadID != "" {
 		thread, terr := client.ListThread(ctx, clicked.ThreadID, maxLarkThreadMessages)
 		if terr != nil {
-			return db.Issue{}, false, fmt.Errorf("list thread: %w", terr)
+			return db.Issue{}, larkCreated, fmt.Errorf("list thread: %w", terr)
 		}
 		if len(thread) > 0 {
 			messages = thread
@@ -325,7 +351,18 @@ func (h *Handler) importLarkThread(ctx context.Context, messageID string) (db.Is
 
 	wsUUID, err := util.ParseUUID(h.cfg.Lark.WorkspaceID)
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("invalid MULTICA_LARK_WORKSPACE_ID: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("invalid MULTICA_LARK_WORKSPACE_ID: %w", err)
+	}
+
+	// If this thread already maps to an issue, update it (append a comment +
+	// re-trigger the agent) instead of creating a duplicate.
+	if existing, ok, ferr := h.findIssueByLarkThread(ctx, wsUUID, threadKey); ferr != nil {
+		slog.Warn("lark webhook: thread lookup failed", "thread", threadKey, "error", ferr)
+	} else if ok {
+		if uerr := h.updateLarkIssue(ctx, existing, messages); uerr != nil {
+			return db.Issue{}, larkUpdated, uerr
+		}
+		return existing, larkUpdated, nil
 	}
 
 	// Re-upload attachments before creating the issue so we can link them at
@@ -346,11 +383,83 @@ func (h *Handler) importLarkThread(ctx context.Context, messageID string) (db.Is
 	title := larkTitle(messages)
 	description := larkDescription(messages)
 
-	issue, dup, err := h.createLarkIssue(ctx, wsUUID, title, description, attachmentIDs)
+	issue, outcome, err := h.createLarkIssue(ctx, wsUUID, title, description, attachmentIDs)
 	if err != nil {
+		return db.Issue{}, larkCreated, err
+	}
+	// Stamp the thread→issue link so future @mentions update rather than
+	// duplicate. Best-effort: a failure here just means the next mention
+	// creates a new task (the old behaviour), not a crash.
+	if outcome == larkCreated {
+		if _, merr := h.Queries.SetIssueMetadataKey(ctx, db.SetIssueMetadataKeyParams{
+			Key:         "lark_thread_id",
+			Value:       []byte(fmt.Sprintf("%q", threadKey)),
+			ID:          issue.ID,
+			WorkspaceID: wsUUID,
+		}); merr != nil {
+			slog.Warn("lark webhook: failed to stamp lark_thread_id", "issue_id", uuidToString(issue.ID), "error", merr)
+		}
+	}
+	return issue, outcome, nil
+}
+
+// findIssueByLarkThread returns the issue (if any) previously created from the
+// given Lark thread, matched on metadata.lark_thread_id. Uses a raw query
+// since there's no dedicated sqlc getter; scoped to the workspace and to the
+// most recent match. ok=false (nil error) means "no such issue".
+func (h *Handler) findIssueByLarkThread(ctx context.Context, wsUUID pgtype.UUID, threadKey string) (db.Issue, bool, error) {
+	if threadKey == "" || h.DB == nil {
+		return db.Issue{}, false, nil
+	}
+	filter := fmt.Sprintf(`{"lark_thread_id": %q}`, threadKey)
+	const q = `SELECT id, workspace_id, number, title, status FROM issue
+		WHERE workspace_id = $1 AND metadata @> $2::jsonb
+		ORDER BY created_at DESC LIMIT 1`
+	var iss db.Issue
+	err := h.DB.QueryRow(ctx, q, wsUUID, filter).Scan(&iss.ID, &iss.WorkspaceID, &iss.Number, &iss.Title, &iss.Status)
+	if err != nil {
+		if isNotFound(err) {
+			return db.Issue{}, false, nil
+		}
 		return db.Issue{}, false, err
 	}
-	return issue, dup, nil
+	return iss, true, nil
+}
+
+// updateLarkIssue appends the latest thread context as a comment on an existing
+// issue and re-triggers the assigned agent (mirrors the member-comment path in
+// CreateComment). The comment is authored by the configured creator member.
+func (h *Handler) updateLarkIssue(ctx context.Context, issue db.Issue, messages []lark.Message) error {
+	creatorUUID, err := util.ParseUUID(h.cfg.Lark.CreatorUserID)
+	if err != nil {
+		return fmt.Errorf("invalid MULTICA_LARK_CREATOR_USER_ID: %w", err)
+	}
+	body := "🔄 Updated context from Lark:\n\n" + larkDescription(messages)
+	comment, err := h.Queries.CreateComment(ctx, db.CreateCommentParams{
+		IssueID:     issue.ID,
+		WorkspaceID: issue.WorkspaceID,
+		AuthorType:  "member",
+		AuthorID:    creatorUUID,
+		Content:     body,
+		Type:        "comment",
+	})
+	if err != nil {
+		return fmt.Errorf("append comment: %w", err)
+	}
+	// Re-load the full issue so the enqueue sees the live assignee/status.
+	full, err := h.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID:          issue.ID,
+		WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil {
+		return nil // comment landed; agent re-trigger is best-effort
+	}
+	if h.shouldEnqueueOnComment(ctx, full, "member", h.cfg.Lark.CreatorUserID) {
+		if _, eerr := h.TaskService.EnqueueTaskForIssue(ctx, full, comment.ID); eerr != nil {
+			slog.Warn("lark webhook: re-enqueue on update failed", "issue_id", uuidToString(issue.ID), "error", eerr)
+		}
+	}
+	return nil
 }
 
 // uploadLarkResource downloads a Lark resource and stores it as a Multica
@@ -397,19 +506,19 @@ func (h *Handler) uploadLarkResource(ctx context.Context, client *lark.Client, w
 
 // createLarkIssue runs the same guarded create+enqueue transaction as
 // CreateIssue, hard-wired to the configured creator + triage agent. Returns
-// (issue, isDuplicate, error).
-func (h *Handler) createLarkIssue(ctx context.Context, wsUUID pgtype.UUID, title, description string, attachmentIDs []pgtype.UUID) (db.Issue, bool, error) {
+// (issue, outcome, error) where outcome is larkCreated or larkDuplicate.
+func (h *Handler) createLarkIssue(ctx context.Context, wsUUID pgtype.UUID, title, description string, attachmentIDs []pgtype.UUID) (db.Issue, larkOutcome, error) {
 	priority := h.cfg.Lark.Priority
 	if priority == "" {
 		priority = "medium"
 	}
 	creatorUUID, err := util.ParseUUID(h.cfg.Lark.CreatorUserID)
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("invalid MULTICA_LARK_CREATOR_USER_ID: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("invalid MULTICA_LARK_CREATOR_USER_ID: %w", err)
 	}
 	agentUUID, err := util.ParseUUID(h.cfg.Lark.AgentID)
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("invalid MULTICA_LARK_AGENT_ID: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("invalid MULTICA_LARK_AGENT_ID: %w", err)
 	}
 
 	// Validate the creator is a real member and the agent a real, non-archived
@@ -418,22 +527,22 @@ func (h *Handler) createLarkIssue(ctx context.Context, wsUUID pgtype.UUID, title
 		UserID:      creatorUUID,
 		WorkspaceID: wsUUID,
 	}); err != nil {
-		return db.Issue{}, false, fmt.Errorf("creator is not a member of the workspace")
+		return db.Issue{}, larkCreated, fmt.Errorf("creator is not a member of the workspace")
 	}
 	agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
 		ID:          agentUUID,
 		WorkspaceID: wsUUID,
 	})
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("triage agent not found in workspace")
+		return db.Issue{}, larkCreated, fmt.Errorf("triage agent not found in workspace")
 	}
 	if agent.ArchivedAt.Valid {
-		return db.Issue{}, false, fmt.Errorf("triage agent is archived")
+		return db.Issue{}, larkCreated, fmt.Errorf("triage agent is archived")
 	}
 
 	tx, err := h.TxStarter.Begin(ctx)
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("begin tx: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	qtx := h.Queries.WithTx(tx)
@@ -441,20 +550,20 @@ func (h *Handler) createLarkIssue(ctx context.Context, wsUUID pgtype.UUID, title
 	// Active-duplicate guard (top-level issue: no project / parent).
 	duplicate, found, err := issueguard.LockAndFindActiveDuplicate(ctx, qtx, wsUUID, pgtype.UUID{}, pgtype.UUID{}, title, false)
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("duplicate guard: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("duplicate guard: %w", err)
 	}
 	if found {
-		return duplicate, true, nil
+		return duplicate, larkDuplicate, nil
 	}
 
 	number, err := qtx.IncrementIssueCounter(ctx, wsUUID)
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("increment counter: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("increment counter: %w", err)
 	}
 
 	position, err := issueposition.NextTopPosition(ctx, tx, wsUUID, "todo")
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("next position: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("next position: %w", err)
 	}
 
 	issue, err := qtx.CreateIssue(ctx, db.CreateIssueParams{
@@ -471,11 +580,11 @@ func (h *Handler) createLarkIssue(ctx context.Context, wsUUID pgtype.UUID, title
 		Number:       number,
 	})
 	if err != nil {
-		return db.Issue{}, false, fmt.Errorf("create issue: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("create issue: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return db.Issue{}, false, fmt.Errorf("commit: %w", err)
+		return db.Issue{}, larkCreated, fmt.Errorf("commit: %w", err)
 	}
 
 	// Link attachments (post-commit, best-effort — mirrors CreateIssue).
@@ -491,7 +600,7 @@ func (h *Handler) createLarkIssue(ctx context.Context, wsUUID pgtype.UUID, title
 			"issue_id", uuidToString(issue.ID), "error", err)
 	}
 
-	return issue, false, nil
+	return issue, larkCreated, nil
 }
 
 // ── rendering ────────────────────────────────────────────────────────────---
