@@ -185,13 +185,34 @@ func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
 	ident := fmt.Sprintf("%s-%d", prefix, issue.Number)
-	reply := "✅ Created task " + ident
+	link := h.larkIssueURL(r.Context(), issue)
+	verb := "✅ Created task"
 	if dup {
-		reply = "ℹ️ Task already exists: " + ident
+		verb = "ℹ️ Task already exists:"
+	}
+	reply := verb + " " + ident
+	if link != "" {
+		reply = verb + " " + ident + "\n" + link
 	}
 	slog.Info("lark webhook: issue ready", "identifier", ident, "duplicate", dup)
 	h.larkReply(r.Context(), threadAnchor, reply)
 	writeJSON(w, http.StatusOK, map[string]string{"msg": "ok", "identifier": ident})
+}
+
+// larkIssueURL builds the public web-app URL for an issue, or "" when AppURL
+// is not configured. Format: {AppURL}/{workspaceSlug}/issues/{issueUUID}. The
+// detail page resolves either the UUID or the PREFIX-N identifier; we use the
+// UUID since it's always unambiguous.
+func (h *Handler) larkIssueURL(ctx context.Context, issue db.Issue) string {
+	base := strings.TrimRight(h.cfg.Lark.AppURL, "/")
+	if base == "" {
+		return ""
+	}
+	ws, err := h.Queries.GetWorkspace(ctx, issue.WorkspaceID)
+	if err != nil || ws.Slug == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/%s/issues/%s", base, ws.Slug, uuidToString(issue.ID))
 }
 
 // larkMentionsBot reports whether the bot was @mentioned in the message. When

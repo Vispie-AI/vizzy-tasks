@@ -106,6 +106,10 @@ type LarkConfig struct {
 	// messages that @mention this id; when empty, any @mention triggers it.
 	// Optional — leave unset if the bot is the only app mentioned in your chats.
 	BotOpenID string
+	// AppURL is the public base URL of the Multica web app (no trailing slash),
+	// e.g. "https://tasks.vizzylabs.ai". Used to build a clickable issue link in
+	// the bot's reply. When empty, the reply falls back to the bare identifier.
+	AppURL string
 	// Priority for created issues (none|low|medium|high|urgent). Defaults to
 	// "medium" when unset.
 	Priority string
