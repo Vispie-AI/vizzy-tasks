@@ -1,0 +1,84 @@
+name: deploy
+
+# Auto-deploy the backend to the self-hosted box on every push to main.
+# Uses GitHub OIDC to assume an AWS role (no long-lived keys) and runs
+# deploy.sh on the instance via SSM. Backend-only (frontend rarely changes).
+#
+# Manual runs: Actions tab → "deploy" → Run workflow (workflow_dispatch).
+
+on:
+  push:
+    branches: [main]
+    # Skip deploys for doc-only / CI-only changes.
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".github/**"
+  workflow_dispatch:
+
+concurrency:
+  # Never run two deploys at once; cancel an in-flight deploy if a newer
+  # push lands.
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_ID: i-017657914b9cfafb6
+  ENV_FILE: /home/ec2-user/multica/.env
+  REPO_DIR: /home/ec2-user/vizzy-tasks
+  ROLE_ARN: arn:aws:iam::590184069312:role/vizzy-tasks-deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Trigger deploy.sh on the instance via SSM
+        id: send
+        run: |
+          set -euo pipefail
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "GHA deploy ${GITHUB_SHA::7}" \
+            --timeout-seconds 1800 \
+            --parameters commands="cd $REPO_DIR && sudo ENV_FILE=$ENV_FILE ./deploy.sh" \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "Dispatched SSM command: $CMD_ID"
+
+      - name: Wait for deploy to finish
+        run: |
+          set -euo pipefail
+          CMD_ID="${{ steps.send.outputs.command_id }}"
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            echo "poll $i: $STATUS"
+            case "$STATUS" in
+              Success) echo "Deploy succeeded."; break ;;
+              Failed|Cancelled|TimedOut) echo "Deploy ended: $STATUS"; FAILED=1; break ;;
+              *) sleep 20 ;;
+            esac
+          done
+          echo "----- deploy output (stdout tail) -----"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text | tail -40 || true
+          echo "----- stderr tail -----"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardErrorContent' --output text | tail -20 || true
+          if [ "${FAILED:-0}" = "1" ] || [ "${STATUS:-}" != "Success" ]; then
+            echo "::error::Deploy did not succeed (status=${STATUS:-unknown})"
+            exit 1
+          fi
